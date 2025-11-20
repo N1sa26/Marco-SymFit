@@ -1,0 +1,33 @@
+# 不需要的文件和目录
+bridge_fifo_to_queue.py
+pipe_monitor.py
+test_scheduler.py
+test_taint.c
+test_taint_with_calls.c
+test_input
+testfile
+complex_target
+covmap
+disabled
+myfifo
+pcpipe
+fifo/
+
+# 日志目录中的历史文件
+logs/last_run_*.txt
+logs/*.old
+logs/test_*.log
+
+# 输出目录中的临时文件（测试运行时会生成）
+output/tmp
+output/tree0/id:*
+output/tree1/id:*
+output/fifo/queue/id:*
+output/afl-slave/queue/id:*
+
+# 但保留目录结构
+!output/tree0/
+!output/tree1/
+!output/fifo/queue/
+!output/afl-slave/queue/
+

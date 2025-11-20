@@ -1,0 +1,41 @@
+# Build directories
+build/
+*/build/
+
+# Test outputs and temporary files
+tests/symfit/test
+tests/symfit/testfile
+tests/symfit/workdir/
+*.o
+*.so
+*.a
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Coverage maps
+covmap
+*.cov
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Generated files
+*.gen.cpp
+*.gen.h
+qapi-generated/
+
