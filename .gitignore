@@ -1,0 +1,38 @@
+# 编译产物
+marco/fastgen/fastgen
+marco/src/CE/target/
+marco/src/CE/fuzzer/cpp_core/build/
+symfit/build/
+symfit-source/build/
+symfit-source/config-*
+symfit-source/*.mak
+symfit-source/config.status
+symfit-source/linux-headers/
+symfit-source/roms/
+symfit-source/x86_64-linux-user/
+
+# 测试输出和日志
+test/workdir/output/
+test/workdir/logs/
+test/workdir/targets/
+test/workdir/seed/
+test/workdir/disabled
+
+# 备份文件
+*.bak
+*.backup
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# IDE文件
+.vscode/
+.idea/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db
+

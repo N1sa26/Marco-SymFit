@@ -21,6 +21,9 @@
 #include <glob.h>
 #include <thread>
 #include <chrono>
+#include <array>
+#include <cctype>
+#include <vector>
 
 #define B_FLIPPED 0x1
 #define THREAD_POOL_SIZE 1
@@ -41,6 +44,9 @@ bool SAVING_WHOLE;
 XXH32_hash_t call_stack_hash_;
 static uint32_t max_label_;
 uint32_t dump_tree_id_;
+
+// Test program address range for filtering library function constraints
+// These are set via environment variables: TARGET_BASE_ADDR and TARGET_SIZE
 
 static z3::context __z3_context;
 static z3::solver __z3_solver(__z3_context, "QF_BV");
@@ -128,9 +134,53 @@ struct labeltuple_hash {
 
 typedef std::unordered_set<std::tuple<uint32_t, uint32_t>, labeltuple_hash> labeltuple_set_t;
 
+// Extended constraint tuple: (label, tkdir, addr, ctx, path_prefix_hash) to identify source-level branch and execution path
+struct constraint_tuple_t {
+  uint32_t label;
+  uint32_t tkdir;
+  uint64_t addr;
+  uint32_t ctx;
+  uint64_t path_prefix_hash;  // Path prefix hash to identify execution path
+  
+  bool operator==(const constraint_tuple_t& other) const {
+    return label == other.label && tkdir == other.tkdir && 
+           addr == other.addr && ctx == other.ctx &&
+           path_prefix_hash == other.path_prefix_hash;
+  }
+};
+
+struct constraint_tuple_hash {
+  std::size_t operator()(const constraint_tuple_t& t) const {
+    // Use XXH32 for addr, ctx, and path_prefix_hash to improve hash distribution
+    XXH32_state_t state_addr;
+    XXH32_reset(&state_addr, 0);
+    XXH32_update(&state_addr, &t.addr, sizeof(t.addr));
+    std::size_t hash_addr = XXH32_digest(&state_addr);
+
+    XXH32_state_t state_ctx;
+    XXH32_reset(&state_ctx, 0);
+    XXH32_update(&state_ctx, &t.ctx, sizeof(t.ctx));
+    std::size_t hash_ctx = XXH32_digest(&state_ctx);
+
+    XXH32_state_t state_pp;
+    XXH32_reset(&state_pp, 0);
+    XXH32_update(&state_pp, &t.path_prefix_hash, sizeof(t.path_prefix_hash));
+    std::size_t hash_pp = XXH32_digest(&state_pp);
+
+    return std::hash<uint32_t>{}(t.label) ^
+           (std::hash<uint32_t>{}(t.tkdir) << 1) ^
+           (hash_addr << 2) ^
+           (hash_ctx << 3) ^
+           (hash_pp << 4);
+  }
+};
+
+typedef std::unordered_set<constraint_tuple_t, constraint_tuple_hash> constraint_set_t;
+
 typedef struct {
   std::unordered_set<dfsan_label> input_deps;
-  labeltuple_set_t label_tuples;
+  labeltuple_set_t label_tuples;  // Keep for backward compatibility
+  constraint_set_t constraint_tuples;  // New: stores (label, tkdir, addr, ctx)
 } branch_dep_t;
 
 static std::vector<branch_dep_t*> *__branch_deps;
@@ -168,10 +218,11 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, uint32_t predi
     default:
       printf("FATAL: unsupported predicate: %u\n", predicate);
       // throw z3::exception("unsupported predicate");
-      break;
+      return lhs == rhs;  // Return default comparison
   }
   // should never reach here
   //Die();
+  return lhs == rhs;  // Return default comparison
 }
 
 static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<uint32_t> &deps) {
@@ -229,6 +280,8 @@ static void get_input_deps(dfsan_label label, std::unordered_set<uint32_t> &deps
 }
 
 // get the extra [label, dir] in the prefix for completing the nested set;
+// Improved filtering: allow multiple source-level branches (different labels) in path prefix,
+// but filter out duplicate constraints for the same label
 std::string get_extra_tuple(dfsan_label label, uint32_t tkdir, int ifmemorize) {
   std::string res = "";
   // deps of the label alone
@@ -259,20 +312,32 @@ std::string get_extra_tuple(dfsan_label label, uint32_t tkdir, int ifmemorize) {
     if (inputs.size() == 0) return res;
 
     if (ifmemorize) {
-      // addconstr::Extracon* extra_con = new_trace.add_extracon();
-      // extra_con->set_id(label);
-
+      // Marco-compatible: collect all label_tuples without path prefix filtering
+      // Path prefix hash is only used for path deduplication, not for constraint filtering
+      // Limit constraint count to avoid too many constraints causing nested unsat
+      const size_t MAX_EXTRA_CONSTRAINTS = 10;
       labeltuple_set_t added;
+      size_t constraint_count = 0;
       for (auto off : inputs) {
         auto deps = get_branch_dep(off);
         if (deps != nullptr) {
           for (auto &expr : deps->label_tuples) {
             if (added.insert(expr).second) {
               res += (std::to_string(std::get<0>(expr)) + "," + std::to_string(std::get<1>(expr)) + ".");
-              // addconstr::Extracon::LabelTuple* new_tuple = extra_con->add_labeltuples();
-              // new_tuple->set_eid(std::get<0>(expr));
-              // new_tuple->set_edir(std::get<1>(expr));
+              constraint_count++;
+              if (constraint_count >= MAX_EXTRA_CONSTRAINTS) {
+                // Stop collecting more constraints once limit is reached
+                std::cerr << "build_nested_set_old: WARNING: extra constraint limit reached (" << MAX_EXTRA_CONSTRAINTS << "), stopping collection" << std::endl;
+                if (cxx_log_fp) {
+                  fprintf(cxx_log_fp, "build_nested_set_old: WARNING: extra constraint limit reached (%zu), stopping collection\n", MAX_EXTRA_CONSTRAINTS);
+                  fflush(cxx_log_fp);
+                }
+                break;
+              }
             }
+          }
+          if (constraint_count >= MAX_EXTRA_CONSTRAINTS) {
+            break;
           }
         }
       }
@@ -438,16 +503,32 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<uint32_t> &deps)
     case DFSAN_UREM:    return cache_expr(label, z3::urem(op1, op2), deps);
     case DFSAN_SREM:    return cache_expr(label, z3::srem(op1, op2), deps);
                   // relational
-    case DFSAN_ICMP:    return cache_expr(label, get_cmd(op1, op2, info->op >> 8), deps);
+    case DFSAN_ICMP:    {
+      z3::expr cmp_result = get_cmd(op1, op2, info->op >> 8);
+      // Ensure ICmp operations return bool type
+      if (!cmp_result.is_bool()) {
+        // If get_cmd returns non-bool (shouldn't happen), convert to bool
+        if (cmp_result.get_sort().is_bv()) {
+          cmp_result = (cmp_result != __z3_context.bv_val(0, cmp_result.get_sort().bv_size()));
+        }
+        std::cerr << "build_nested_set_old: WARNING: ICmp returned non-bool, converted for label=" << label << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "build_nested_set_old: WARNING: ICmp returned non-bool, converted for label=%u\n", label);
+          fflush(cxx_log_fp);
+        }
+      }
+      return cache_expr(label, cmp_result, deps);
+    }
                   // concat
     case DFSAN_CONCAT:  return cache_expr(label, z3::concat(op2, op1), deps); // little endian
     default:
                   printf("FATAL: unsupported op: %u\n", info->op);
                   // throw z3::exception("unsupported operator");
-                  break;
+                  return __z3_context.bv_val(0, info->size);  // Return default value
   }
   // should never reach here
   //Die();
+  return __z3_context.bv_val(0, info->size);  // Return default value
 }
 
 void init(bool saving_whole) {
@@ -604,6 +685,23 @@ int build_nested_set_old(std::string extra, uint32_t label, uint32_t conc_dir, s
 
     __z3_solver.reset();
     __z3_solver.add(cond_bool != result);
+    // Log main constraint with type information
+    std::string cond_type = cond.is_bool() ? "bool" : (cond.get_sort().is_bv() ? "bv" : "unknown");
+    std::cerr << "build_nested_set_old: main constraint: label=" << label << " conc_dir=" << conc_dir 
+              << " inputs.size()=" << inputs.size() << " type=" << cond_type;
+    if (cond.get_sort().is_bv()) {
+      std::cerr << " bv_size=" << cond.get_sort().bv_size();
+    }
+    std::cerr << " expr=" << cond << " constraint=" << (cond_bool != result) << std::endl;
+    if (cxx_log_fp) {
+      fprintf(cxx_log_fp, "build_nested_set_old: main constraint: label=%u conc_dir=%u inputs.size()=%zu type=%s",
+              label, conc_dir, inputs.size(), cond_type.c_str());
+      if (cond.get_sort().is_bv()) {
+        fprintf(cxx_log_fp, " bv_size=%u", cond.get_sort().bv_size());
+      }
+      fprintf(cxx_log_fp, " expr=%s\n", cond.to_string().c_str());
+      fflush(cxx_log_fp);
+    }
     std::cerr << "build_nested_set_old: about to check solver (opt set)" << std::endl;
     std::cout << "build_nested_set_old: about to check solver (opt set)" << std::endl;
     fflush(stdout);
@@ -618,26 +716,195 @@ int build_nested_set_old(std::string extra, uint32_t label, uint32_t conc_dir, s
     // check if opt set is sat
     if (res == z3::sat) {
       std::cout << "build_nested_set_old: opt sat" << std::endl;
+      std::cerr << "build_nested_set_old: opt sat, extra=\"" << extra << "\"" << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: opt sat, extra=\"%s\"\n", extra.c_str());
+        fflush(cxx_log_fp);
+      }
       z3::model m_opt = __z3_solver.get_model();
       __z3_solver.push();
 
       // collect additional constraints
-      while ((pos1 = extra.find("#")) != std::string::npos) {
-        entry = extra.substr(0, pos1);
-        if ((pos2 = entry.find(".")) != std::string::npos) {
-          e_label = stoul(entry.substr(0, pos2));
-          entry.erase(0, pos2+1);
-          e_dir = stoul(entry);
+      std::vector<std::pair<uint32_t, uint32_t>> constraint_list; // Store all constraints for logging
+      auto append_extra_constraint = [&](const std::string& raw_entry) {
+        if (raw_entry.empty()) {
+          return;
+        }
+        auto trim_trailing = [](std::string s) {
+          while (!s.empty() && (s.back() == '#' || s.back() == '.' || s.back() == ',' || std::isspace(static_cast<unsigned char>(s.back())))) {
+            s.pop_back();
+          }
+          return s;
+        };
+        std::string entry = trim_trailing(raw_entry);
+        if (entry.empty()) {
+          return;
+        }
+        
+        // Support both formats:
+        // 1. "label,dir." (Marco original format from get_extra_tuple)
+        // 2. "label.dir" (converted format, possibly from scheduler)
+        size_t delim_pos = std::string::npos;
+        size_t comma_pos = entry.find(',');
+        size_t dot_pos = entry.find('.');
+        
+        // Prefer comma if present (Marco original format: "label,dir.")
+        if (comma_pos != std::string::npos) {
+          delim_pos = comma_pos;
+        } else if (dot_pos != std::string::npos) {
+          // Use dot if no comma (converted format: "label.dir")
+          delim_pos = dot_pos;
+        }
+        
+        if (delim_pos == std::string::npos) {
+          std::cerr << "build_nested_set_old: malformed extra entry \"" << entry << "\"" << std::endl;
+          if (cxx_log_fp) {
+            fprintf(cxx_log_fp, "build_nested_set_old: malformed extra entry \"%s\"\n", entry.c_str());
+            fflush(cxx_log_fp);
+          }
+          return;
+        }
+        
+        std::string label_part = entry.substr(0, delim_pos);
+        std::string dir_part = entry.substr(delim_pos + 1);
+        label_part = trim_trailing(label_part);
+        dir_part = trim_trailing(dir_part);
+        
+        // Remove trailing dot or comma from dir_part
+        while (!dir_part.empty() && (dir_part.back() == '.' || dir_part.back() == ',' || dir_part.back() == '#')) {
+          dir_part.pop_back();
+        }
+        
+        if (label_part.empty() || dir_part.empty()) {
+          std::cerr << "build_nested_set_old: empty label/dir in extra entry \"" << raw_entry << "\"" << std::endl;
+          if (cxx_log_fp) {
+            fprintf(cxx_log_fp, "build_nested_set_old: empty label/dir in extra entry \"%s\"\n", raw_entry.c_str());
+            fflush(cxx_log_fp);
+          }
+          return;
+        }
+        e_label = stoul(label_part);
+        e_dir = stoul(dir_part);
+        constraint_list.push_back(std::make_pair(e_label, e_dir)); // Record constraint
           std::unordered_set<dfsan_label> e_inputs;
           z3::expr e_cond = serialize(e_label, e_inputs);
-          z3::expr e_result = __z3_context.bool_val(e_dir);
-          __z3_solver.add(e_cond == e_result);
+        // Marco-compatible: directly use e_cond (assume it's bool for ICmp operations)
+        // If e_cond is not bool, it should be handled in serialize() or get_cmd()
+        
+        // Debug: Log constraint expression and type
+        std::string cond_type = e_cond.is_bool() ? "bool" : (e_cond.get_sort().is_bv() ? "bv" : "unknown");
+        std::cerr << "build_nested_set_old: adding nested constraint label=" << e_label << " dir=" << e_dir 
+                  << " inputs.size()=" << e_inputs.size() << " type=" << cond_type;
+        if (e_cond.get_sort().is_bv()) {
+          std::cerr << " bv_size=" << e_cond.get_sort().bv_size();
         }
-        extra.erase(0, pos1 + 1);
+        std::cerr << " expr=" << e_cond << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "build_nested_set_old: adding nested constraint label=%u dir=%u inputs.size()=%zu type=%s",
+                  e_label, e_dir, e_inputs.size(), cond_type.c_str());
+          if (e_cond.get_sort().is_bv()) {
+            fprintf(cxx_log_fp, " bv_size=%u", e_cond.get_sort().bv_size());
+          }
+          fprintf(cxx_log_fp, " expr=%s\n", e_cond.to_string().c_str());
+          fflush(cxx_log_fp);
+        }
+        
+        // Ensure e_cond is bool type for ICmp operations
+        z3::expr e_cond_bool = e_cond;
+        if (!e_cond.is_bool() && e_cond.get_sort().is_bv()) {
+          // Convert bv to bool: bv != 0
+          e_cond_bool = (e_cond != __z3_context.bv_val(0, e_cond.get_sort().bv_size()));
+          std::cerr << "build_nested_set_old: WARNING: converted bv to bool for label=" << e_label << std::endl;
+          if (cxx_log_fp) {
+            fprintf(cxx_log_fp, "build_nested_set_old: WARNING: converted bv to bool for label=%u\n", e_label);
+            fflush(cxx_log_fp);
+          }
+        }
+        
+        z3::expr e_result = __z3_context.bool_val(e_dir);
+        __z3_solver.add(e_cond_bool == e_result);
+      };
+
+      // Normalize SymFit scheduler encoding: only convert '@' to '#' as separator.
+      // Do NOT convert '.' to '#' because '.' is part of "label.dir" format.
+      // The scheduler already sends format like "label1.dir1#label2.dir2#..."
+      auto normalize_extra = [](const std::string& src) {
+        std::string normalized;
+        normalized.reserve(src.size());
+        for (size_t idx = 0; idx < src.size(); ++idx) {
+          char ch = src[idx];
+          if (ch == '@') {
+            normalized.push_back('#');
+            continue;
+          }
+          // Keep '.' as is - it's part of "label.dir" format, not a separator
+          normalized.push_back(ch);
+        }
+        return normalized;
+      };
+      std::cerr << "build_nested_set_old: BEFORE normalize, extra=\"" << extra << "\"" << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: BEFORE normalize, extra=\"%s\"\n", extra.c_str());
+        fflush(cxx_log_fp);
+      }
+      std::string normalized_extra = normalize_extra(extra);
+      std::cerr << "build_nested_set_old: AFTER normalize, normalized_extra=\"" << normalized_extra << "\"" << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: AFTER normalize, normalized_extra=\"%s\"\n", normalized_extra.c_str());
+        fflush(cxx_log_fp);
+      }
+      while ((pos1 = normalized_extra.find("#")) != std::string::npos) {
+        entry = normalized_extra.substr(0, pos1);
+        std::cerr << "build_nested_set_old: processing entry=\"" << entry << "\"" << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "build_nested_set_old: processing entry=\"%s\"\n", entry.c_str());
+          fflush(cxx_log_fp);
+        }
+        append_extra_constraint(entry);
+        normalized_extra.erase(0, pos1 + 1);
+      }
+      if (!normalized_extra.empty()) {
+        std::cerr << "build_nested_set_old: processing final entry=\"" << normalized_extra << "\"" << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "build_nested_set_old: processing final entry=\"%s\"\n", normalized_extra.c_str());
+          fflush(cxx_log_fp);
+        }
+        append_extra_constraint(normalized_extra);
+        normalized_extra.clear();
+      }
+      // Log constraint summary before nested check
+      std::cerr << "build_nested_set_old: nested constraint summary: total_constraints=" << constraint_list.size() << std::endl;
+      std::cerr << "build_nested_set_old: constraint_list=[";
+      for (size_t i = 0; i < constraint_list.size(); ++i) {
+        std::cerr << constraint_list[i].first << "." << constraint_list[i].second;
+        if (i < constraint_list.size() - 1) std::cerr << "#";
+      }
+      std::cerr << "]" << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: nested constraint summary: total_constraints=%zu\n", constraint_list.size());
+        fprintf(cxx_log_fp, "build_nested_set_old: constraint_list=[");
+        for (size_t i = 0; i < constraint_list.size(); ++i) {
+          fprintf(cxx_log_fp, "%u.%u", constraint_list[i].first, constraint_list[i].second);
+          if (i < constraint_list.size() - 1) fprintf(cxx_log_fp, "#");
+        }
+        fprintf(cxx_log_fp, "]\n");
+        fflush(cxx_log_fp);
       }
       std::cout << "build_nested_set_old: nested set building done" << std::endl;
       // nested done
+      std::cerr << "build_nested_set_old: about to check nested solver (total constraints: main=1 + nested=" << constraint_list.size() << ")" << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: about to check nested solver (total constraints: main=1 + nested=%zu)\n",
+                constraint_list.size());
+        fflush(cxx_log_fp);
+      }
       res = __z3_solver.check();
+      const char* nested_res_str = (res == z3::sat ? "sat" : (res == z3::unsat ? "unsat" : "unknown"));
+      std::cerr << "build_nested_set_old: nested solver check result=" << nested_res_str << std::endl;
+      if (cxx_log_fp) {
+        fprintf(cxx_log_fp, "build_nested_set_old: nested solver check result=%s\n", nested_res_str);
+        fflush(cxx_log_fp);
+      }
       if (res == z3::sat) {
         std::cout << "build_nested_set_old: nested sat" << std::endl;
         if (cxx_log_fp) {
@@ -808,10 +1075,11 @@ int generate_next_tscs(std::ifstream &pcsetpipe) {
       std::cout << "[generate_next_tscs] Stream not good before getline, good=" << pcsetpipe.good() << " eof=" << pcsetpipe.eof() << " fail=" << pcsetpipe.fail() << " bad=" << pcsetpipe.bad() << std::endl;
       if (cxx_log_fp) { fprintf(cxx_log_fp, "stream not good before getline, good=%d eof=%d fail=%d bad=%d\n", pcsetpipe.good(), pcsetpipe.eof(), pcsetpipe.fail(), pcsetpipe.bad()); fflush(cxx_log_fp); }
     }
+    extra.clear();
     if (std::getline(pcsetpipe, line)) {
       if (cxx_log_fp) { fprintf(cxx_log_fp, "getline ok, raw=[%s]\n", line.c_str()); fflush(cxx_log_fp); }
       // trim trailing CR/LF and trailing commas/spaces
-      while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t' || line.back() == ',')) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) {
         line.pop_back();
       }
       if (line.empty()) {
@@ -821,23 +1089,40 @@ int generate_next_tscs(std::ifstream &pcsetpipe) {
       }
       std::cout << "[generate_next_tscs] line: " << line << std::endl;
       if (cxx_log_fp) { fprintf(cxx_log_fp, "line(after trim)=[%s]\n", line.c_str()); fflush(cxx_log_fp); }
-      int token_index = 0;
-      std::cout << "line: " << line << std::endl;
-      while ((pos = line.find(",")) != std::string::npos) {
-          token = line.substr(0, pos);
-          switch (token_index) {
-              case 0: queueid = stoul(token); break;
-              case 1: tree_id = stoul(token); break;
-              case 2: node_id = stoul(token); break;
-              case 3: conc_dir = stoul(token); break;
-              case 4: cur_label_loc = stoul(token); break;
-              case 5: untaken_update_ifsat = stoull(token); break;
-              case 6: extra = token; break;
-              default: break;
-          }
-          line.erase(0, pos + 1);
-          token_index++;
+      std::array<std::string, 6> header_tokens;
+      size_t token_index = 0;
+      std::string payload = line; // copy so we keep original for logging
+      while (token_index < header_tokens.size() && (pos = payload.find(",")) != std::string::npos) {
+        header_tokens[token_index++] = payload.substr(0, pos);
+        payload.erase(0, pos + 1);
       }
+      if (token_index < header_tokens.size()) {
+        std::cout << "[generate_next_tscs] malformed scheduler record (expected 6 commas): " << line << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "malformed scheduler record (token_index=%zu) line=[%s]\n", token_index, line.c_str());
+          fflush(cxx_log_fp);
+        }
+        continue;
+      }
+      try {
+        queueid = stoul(header_tokens[0]);
+        tree_id = stoul(header_tokens[1]);
+        node_id = stoul(header_tokens[2]);
+        conc_dir = stoul(header_tokens[3]);
+        cur_label_loc = stoul(header_tokens[4]);
+        untaken_update_ifsat = stoull(header_tokens[5]);
+      } catch (const std::exception &e) {
+        std::cout << "[generate_next_tscs] failed to parse header tokens: " << e.what() << " line=" << line << std::endl;
+        if (cxx_log_fp) {
+          fprintf(cxx_log_fp, "failed to parse header tokens: %s line=[%s]\n", e.what(), line.c_str());
+          fflush(cxx_log_fp);
+        }
+        continue;
+      }
+      if (!payload.empty() && payload.back() == ',') {
+        payload.pop_back();
+      }
+      extra = payload; // remainder (may contain commas/dots/#, already trimmed above)
       std::cout << "[generate_next_tscs] parsed qid=" << queueid
                 << " tree_id=" << tree_id
                 << " node_id=" << node_id
@@ -1019,6 +1304,8 @@ static int update_graph(dfsan_label label, uint64_t pc, uint32_t tkdir,
       }
 
       uint64_t t_extra = getTimeStamp();
+      // Marco-compatible: get_extra_tuple does not use path prefix hash for filtering
+      // Path prefix hash is only used for path deduplication, not for constraint filtering
       std::string res = get_extra_tuple(label, tkdir, ifmemorize);
       total_extra_time += (getTimeStamp() - t_extra);
 
@@ -1595,6 +1882,8 @@ uint32_t solve(int shmid, uint32_t pipeid, uint32_t brc_flip, std::ifstream &pcs
   uint32_t first_qid = 0; // Track the first qid for tree dump (should match queueid from scheduler)
   bool first_qid_set = false;
   uint32_t first_tid_for_pp = (uint32_t)-1; // Track first tid for path-prefix initialization
+  uint32_t previous_tid = (uint32_t)-1; // Track previous tid to detect tid changes
+  uint32_t previous_dump_tree_id = (uint32_t)-1; // Track previous dump_tree_id_ to generate tree file when tid changes
   std::cout << "[solve] about to enter while loop to read from /tmp/wp2" << std::endl;
   if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] about to enter while loop to read from /tmp/wp2\n"); fflush(cxx_log_fp); }
   while (std::getline(myfile, line))
@@ -1641,21 +1930,42 @@ uint32_t solve(int shmid, uint32_t pipeid, uint32_t brc_flip, std::ifstream &pcs
                 fprintf(stderr, "[solve] DEBUG: case 7, token='%s', tid=%u, first_tid_set=%s, first_tid=%u, dump_tree_id_=%u\n", token.c_str(), tid, (first_tid_set ? "true" : "false"), first_tid, dump_tree_id_);
                 fflush(stderr);
                 if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] DEBUG: case 7, token='%s', tid=%u, first_tid_set=%s, first_tid=%u, dump_tree_id_=%u\n", token.c_str(), tid, (first_tid_set ? "true" : "false"), first_tid, dump_tree_id_); fflush(cxx_log_fp); }
-                // Track first tid for dump_tree_id_ (Marco-compatible)
+                // Marco-compatible: update dump_tree_id_ for each tid
+                // This ensures each tid gets its own tree file generated
                 // Note: tid=-1 (0xFFFFFFFF) means uninitialized, tid=0 is a valid input id
-                if (tid != (uint32_t)-1 && !first_tid_set) {
+                if (tid != (uint32_t)-1) {
+                  // Check if tid has changed - if so, generate tree file for previous tid
+                  if (previous_tid != (uint32_t)-1 && tid != previous_tid && previous_dump_tree_id != (uint32_t)-1) {
+                    // Tid has changed, generate tree file for previous tid
+                    uint32_t tree_dump_qid_for_prev = first_qid_set ? first_qid : qid;
+                    printf("[solve] DEBUG: tid changed from %u to %u, generating tree file for tid=%u (dump_tree_id_=%u)\n", 
+                           previous_tid, tid, previous_tid, previous_dump_tree_id);
+                    fflush(stdout);
+                    if (cxx_log_fp) { 
+                      fprintf(cxx_log_fp, "[solve] DEBUG: tid changed from %u to %u, generating tree file for tid=%u (dump_tree_id_=%u)\n", 
+                              previous_tid, tid, previous_tid, previous_dump_tree_id); 
+                      fflush(cxx_log_fp); 
+                    }
+                    // Temporarily set dump_tree_id_ to previous value for tree file generation
+                    uint32_t saved_dump_tree_id = dump_tree_id_;
+                    dump_tree_id_ = previous_dump_tree_id;
+                    generate_tree_dump(tree_dump_qid_for_prev);
+                    dump_tree_id_ = saved_dump_tree_id;
+                  }
+                  
+                  previous_tid = tid;
+                  previous_dump_tree_id = dump_tree_id_;
+                  dump_tree_id_ = tid;
+                  
+                  if (!first_tid_set) {
                   first_tid = tid;
                   first_tid_set = true;
-                dump_tree_id_ = tid;
                   printf("[solve] DEBUG: first_tid set to %u, dump_tree_id_ set to %u\n", first_tid, dump_tree_id_);
                   fflush(stdout);
                   fprintf(stderr, "[solve] DEBUG: first_tid set to %u, dump_tree_id_ set to %u\n", first_tid, dump_tree_id_);
                   fflush(stderr);
                   if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] DEBUG: first_tid set to %u, dump_tree_id_ set to %u\n", first_tid, dump_tree_id_); fflush(cxx_log_fp); }
-                } else if (tid != (uint32_t)-1) {
-                  // Update dump_tree_id_ if we haven't set it yet or if current tid is different
-                  if (dump_tree_id_ == 0 || tid != dump_tree_id_) {
-                    dump_tree_id_ = tid;
+                  } else {
                     printf("[solve] DEBUG: updated dump_tree_id_ to %u (tid=%u)\n", dump_tree_id_, tid);
                     fflush(stdout);
                     fprintf(stderr, "[solve] DEBUG: updated dump_tree_id_ to %u (tid=%u)\n", dump_tree_id_, tid);
@@ -1744,6 +2054,17 @@ uint32_t solve(int shmid, uint32_t pipeid, uint32_t brc_flip, std::ifstream &pcs
       bool try_solve = false;
       int uniq_pcset = 0;
       int ifmemorize = 0;
+      
+      // Always update path_prefix to track execution path, regardless of brc_flip mode
+      // This ensures path_prefix_hash is available for constraint filtering
+      // Note: roll_in_pp updates path_prefix and returns untaken_digest
+      uint64_t untaken_digest_for_path = roll_in_pp(label, addr, direction ? 1ULL : 0ULL, &path_prefix);
+      // Only set untaken_update_ifsat if isInterestingPathPrefix would have been called
+      // For brc_flip == 0, we still need path_prefix_hash for constraint filtering
+      if (untaken_update_ifsat == 0) {
+        untaken_update_ifsat = untaken_digest_for_path;
+      }
+      
       switch (brc_flip) {
         case 0: // using qsym style branch filter
           BRC_MODE = 1;
@@ -1846,16 +2167,37 @@ uint32_t solve(int shmid, uint32_t pipeid, uint32_t brc_flip, std::ifstream &pcs
 
   fid = 0; // reset for next input seed
   // at the end of each execution, dump tree and flush everything of the running seed
-  // Use first_qid (from /tmp/wp2) for tree dump, which should match queueid from scheduler
+  // Marco-compatible: use first_qid (from /tmp/wp2) for tree dump, which should match queueid from scheduler
   // This ensures tree dump and gen_solve_pc use the same queueid
-  std::cout << "[solve] DEBUG: before generate_tree_dump, first_qid_set=" << (first_qid_set ? "true" : "false") << ", first_qid=" << first_qid << ", qid=" << qid << std::endl;
-  fflush(stdout);
-  if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] DEBUG: before generate_tree_dump, first_qid_set=%s, first_qid=%u, qid=%u\n", (first_qid_set ? "true" : "false"), first_qid, qid); fflush(cxx_log_fp); }
+  // Note: We now generate tree files when tid changes, so at the end we need to generate
+  // the tree file for the last tid (if it hasn't been generated yet when tid changed)
   uint32_t tree_dump_qid = first_qid_set ? first_qid : qid;
-  std::cout << "[solve] calling generate_tree_dump with qid=" << tree_dump_qid << " (first_qid_set=" << (first_qid_set ? "true" : "false") << ", first_qid=" << first_qid << ", last_qid=" << qid << ")" << std::endl;
-  fflush(stdout);
-  if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] calling generate_tree_dump with qid=%u (first_qid_set=%s, first_qid=%u, last_qid=%u)\n", tree_dump_qid, (first_qid_set ? "true" : "false"), first_qid, qid); fflush(cxx_log_fp); }
-  generate_tree_dump(tree_dump_qid);
+  
+  // Generate tree file for the last tid
+  // This is needed because:
+  // 1. If there's only one tid in the solve() call, it won't trigger the tid change logic
+  // 2. If the last tid is different from previous, it was already generated when tid changed
+  //    But we still need to generate it for the last tid
+  // IMPORTANT: Use first_tid (or last tid) instead of dump_tree_id_ which might have been updated to next tid
+  // This fixes the bug where tree files are generated for wrong tid (e.g., tid=1 generates id:000002)
+  uint32_t tree_dump_tid = first_tid_set && first_tid != (uint32_t)-1 ? first_tid : (tid != (uint32_t)-1 ? tid : dump_tree_id_);
+  
+  if (tree_dump_tid != (uint32_t)-1) {
+    // Save current dump_tree_id_ and temporarily set it to tree_dump_tid for tree file generation
+    uint32_t saved_dump_tree_id = dump_tree_id_;
+    dump_tree_id_ = tree_dump_tid;
+    
+    std::cout << "[solve] DEBUG: before generate_tree_dump (end of solve), first_qid_set=" << (first_qid_set ? "true" : "false") << ", first_qid=" << first_qid << ", qid=" << qid << ", tree_dump_tid=" << tree_dump_tid << ", saved_dump_tree_id=" << saved_dump_tree_id << ", previous_tid=" << previous_tid << std::endl;
+    fflush(stdout);
+    if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] DEBUG: before generate_tree_dump (end of solve), first_qid_set=%s, first_qid=%u, qid=%u, tree_dump_tid=%u, saved_dump_tree_id=%u, previous_tid=%u\n", (first_qid_set ? "true" : "false"), first_qid, qid, tree_dump_tid, saved_dump_tree_id, previous_tid); fflush(cxx_log_fp); }
+    std::cout << "[solve] calling generate_tree_dump with qid=" << tree_dump_qid << ", tid=" << tree_dump_tid << " (first_qid_set=" << (first_qid_set ? "true" : "false") << ", first_qid=" << first_qid << ", last_qid=" << qid << ")" << std::endl;
+    fflush(stdout);
+    if (cxx_log_fp) { fprintf(cxx_log_fp, "[solve] calling generate_tree_dump with qid=%u, tid=%u (first_qid_set=%s, first_qid=%u, last_qid=%u)\n", tree_dump_qid, tree_dump_tid, (first_qid_set ? "true" : "false"), first_qid, qid); fflush(cxx_log_fp); }
+    generate_tree_dump(tree_dump_qid);
+    
+    // Restore dump_tree_id_
+    dump_tree_id_ = saved_dump_tree_id;
+  }
 
   cleanup1(); // flush the union table of the running seed
   cleanup_deps(); // flush the dependency tree
@@ -1903,6 +2245,7 @@ uint32_t solve(int shmid, uint32_t pipeid, uint32_t brc_flip, std::ifstream &pcs
 extern "C" {
   void init_core(bool saving_whole, uint32_t initial_count) {
     init(saving_whole);
+    
     named_pipe_fd = open("/tmp/pcpipe", O_WRONLY);
     // Get log directory from environment or use default
     const char* log_dir = getenv("MARCO_LOG_DIR");

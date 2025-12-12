@@ -2,10 +2,11 @@
 
 set -euo pipefail
 
-# Flags: use --force to perform aggressive cleanup (pkill), otherwise skip.
-FORCE_CLEAN=0
+# Flags: cleanup is enabled by default; pass --no-force to skip aggressive cleanup.
+FORCE_CLEAN=1
 for arg in "$@"; do
   if [ "$arg" = "--force" ]; then FORCE_CLEAN=1; fi
+  if [ "$arg" = "--no-force" ]; then FORCE_CLEAN=0; fi
 done
 
 # Optional: set SUDO=1 in env to use sudo for kill/mkfifo/chmod if needed
@@ -78,6 +79,9 @@ echo ""
 # Create required directories
 # Marco-compatible: create tree0 (for initial seeds) and tree1 (for generated cases)
 mkdir -p "$INPUT_DIR" "$OUTPUT_DIR" "$LOG_DIR" "$TREE0_DIR" "$TREE1_DIR" "$WORK_DIR/fifo"
+# FastGen expects $OUTPUT_DIR/tmp for cur_input/forksrv sockets
+rm -rf "$OUTPUT_DIR/tmp"
+mkdir -p "$OUTPUT_DIR/tmp"
 : > "$LOG_DIR/fastgen.log"
 : > "$LOG_DIR/scheduler.log"
 : > "$LOG_DIR/fastgen_cxx.log"
@@ -92,7 +96,7 @@ if [ "$FORCE_CLEAN" = "1" ]; then
   pkill -f "main.py" || true
   pkill -f "fastgen" || true
 fi
-sleep 1
+sleep 0.3
 
 # Clear tree directories for a clean run (Marco-compatible)
 rm -f "$OUTPUT_DIR/tree0"/id:* 2>/dev/null || true
@@ -113,129 +117,92 @@ rm -f "$OUTPUT_DIR/fifo/queue"/id:* 2>/dev/null || true
 mkdir -p "$OUTPUT_DIR/afl-slave/queue"
 echo "Using seeds from $INPUT_DIR (seeds should be prepared beforehand)"
 
-# Generate 50 initial random seeds if not already present
-echo "Preparing 50 initial random seeds..."
-# Use seeds from test/workdir/seed if available, otherwise create new ones
+# Generate 50 initial random seeds only once
 SEED_SOURCE_DIR="$WORK_DIR/seed"
 SEED_TARGET_DIR="$OUTPUT_DIR/afl-slave/queue"
 INITIAL_SEED_COUNT=50
-
-# Clear existing seeds in afl-slave/queue (keep only initial seeds)
-rm -f "$SEED_TARGET_DIR"/id:* 2>/dev/null || true
-
-# Generate random seeds
-# Note: FastGen's depot requires afl-slave/queue files to have "orig" or "+cov" in the name
-# So we add ",orig" suffix to match AFL naming convention
-for seed_idx in $(seq 0 $((INITIAL_SEED_COUNT - 1))); do
-    target_name=$(printf "id:%06d,orig" "$seed_idx")
-    target_path="$SEED_TARGET_DIR/$target_name"
-    
-    # Generate targeted seeds to explore different paths in complex_target.c
-    # The program has multiple branches:
-    # 1. First char: 'A', 'B', 'C', or other
-    # 2. Length: > 5 or <= 5
-    # 3. Second char (if length>5): 'X', 'Y', or other
-    # 4. String prefix: "TEST", "HELLO", "WORLD", or other
-    # 5. Sum: > 500, > 300, > 100, or <= 100
-    # 6. Even/odd distribution
-    # 7. Pattern matching (if length>=6)
-    
-    case $seed_idx in
-        # First char variations (A, B, C, other)
-        0) echo -n "A" > "$target_path" ;;                    # A, length<=5
-        1) echo -n "B" > "$target_path" ;;                    # B, length<=5
-        2) echo -n "C" > "$target_path" ;;                    # C, length<=5
-        3) echo -n "D" > "$target_path" ;;                    # Other, length<=5
-        
-        # Length > 5 variations
-        4) echo -n "A12345" > "$target_path" ;;               # A, length>5, second char not X/Y
-        5) echo -n "AXYZ123" > "$target_path" ;;             # A, length>5, second char X
-        6) echo -n "AYZ1234" > "$target_path" ;;             # A, length>5, second char Y
-        7) echo -n "B123456" > "$target_path" ;;            # B, length>5
-        8) echo -n "BX12345" > "$target_path" ;;             # B, length>5, second char X
-        9) echo -n "BY12345" > "$target_path" ;;             # B, length>5, second char Y
-        10) echo -n "C123456" > "$target_path" ;;            # C, length>5
-        11) echo -n "CX12345" > "$target_path" ;;            # C, length>5, second char X
-        12) echo -n "CY12345" > "$target_path" ;;            # C, length>5, second char Y
-        13) echo -n "D123456" > "$target_path" ;;            # Other, length>5
-        
-        # String prefix variations (TEST, HELLO, WORLD, other)
-        14) echo -n "TEST" > "$target_path" ;;               # TEST prefix, length=4
-        15) echo -n "TEST123" > "$target_path" ;;            # TEST prefix, length>5
-        16) echo -n "HELLO" > "$target_path" ;;              # HELLO prefix, length=5
-        17) echo -n "HELLO123" > "$target_path" ;;           # HELLO prefix, length>5
-        18) echo -n "WORLD" > "$target_path" ;;              # WORLD prefix, length=5
-        19) echo -n "WORLD123" > "$target_path" ;;           # WORLD prefix, length>5
-        20) echo -n "OTHER" > "$target_path" ;;             # Other prefix, length=5
-        
-        # Sum variations (>500, >300, >100, <=100)
-        21) printf '\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF' > "$target_path" ;;  # Sum > 500 (high values)
-        22) printf '\x80\x80\x80\x80\x80\x80\x80\x80' > "$target_path" ;;         # Sum > 300
-        23) printf '\x40\x40\x40\x40\x40' > "$target_path" ;;                     # Sum > 100
-        24) printf '\x10\x10\x10' > "$target_path" ;;                            # Sum <= 100
-        
-        # Even/odd distribution variations
-        25) printf '\x00\x02\x04\x06\x08\x0A\x0C\x0E' > "$target_path" ;;         # All even
-        26) printf '\x01\x03\x05\x07\x09\x0B\x0D\x0F' > "$target_path" ;;         # All odd
-        27) printf '\x00\x01\x02\x03\x04\x05\x06\x07' > "$target_path" ;;         # Mixed, even > odd
-        28) printf '\x01\x02\x03\x04\x05\x06\x07\x08' > "$target_path" ;;         # Mixed, odd > even
-        29) printf '\x00\x01\x02\x03\x04\x05' > "$target_path" ;;                 # Equal even/odd
-        
-        # Pattern matching variations (length>=6)
-        30) echo -n "AABBCC" > "$target_path" ;;             # Pattern match >= 2 (A==A, B==B, C==C)
-        31) echo -n "AABCCC" > "$target_path" ;;             # Pattern match == 1 (A==A)
-        32) echo -n "ABCDEF" > "$target_path" ;;             # Pattern match == 0 (no matches)
-        33) echo -n "AABBCCDD" > "$target_path" ;;           # Pattern match >= 2, longer
-        
-        # Combined variations
-        34) echo -n "ATEST123" > "$target_path" ;;            # A + TEST prefix
-        35) echo -n "BHELLO123" > "$target_path" ;;          # B + HELLO prefix
-        36) echo -n "CWORLD123" > "$target_path" ;;           # C + WORLD prefix
-        37) echo -n "AXTEST123" > "$target_path" ;;          # A + X + TEST prefix
-        38) echo -n "AYHELLO123" > "$target_path" ;;         # A + Y + HELLO prefix
-        39) echo -n "BXWORLD123" > "$target_path" ;;          # B + X + WORLD prefix
-        
-        # Edge cases
-        40) printf '\x00' > "$target_path" ;;                  # Single null byte
-        41) printf '\xFF' > "$target_path" ;;                 # Single 0xFF
-        42) printf '\x00\x00\x00\x00\x00' > "$target_path" ;; # 5 null bytes (length=5)
-        43) printf '\xFF\xFF\xFF\xFF\xFF\xFF' > "$target_path" ;; # 6 0xFF bytes (length>5)
-        
-        # Random variations for remaining seeds
-        44|45|46|47|48|49)
-            # Generate random content with some structure
-            seed_length=$((RANDOM % 20 + 1))
-            if [ $((seed_idx % 2)) -eq 0 ]; then
-                # Random printable
-                python3 -c "import random, string; print(''.join(random.choices(string.printable, k=$seed_length)), end='')" > "$target_path" 2>/dev/null || \
-                head -c "$seed_length" /dev/urandom | tr -dc '[:print:]' > "$target_path" 2>/dev/null || \
-                echo -n "RANDOM$seed_idx" > "$target_path"
-            else
-                # Random binary
-                head -c "$seed_length" /dev/urandom > "$target_path" 2>/dev/null || \
-                python3 -c "import os; os.write(1, os.urandom($seed_length))" > "$target_path" || \
-                echo -n "RANDOM$seed_idx" > "$target_path"
-            fi
-            ;;
-        *)
-            # Fallback
-            echo -n "seed$seed_idx" > "$target_path"
-            ;;
-    esac
-    
-    # Ensure file is not empty
-    if [ ! -s "$target_path" ]; then
-        echo "seed$seed_idx" > "$target_path"
-    fi
-done
-
-echo "Generated $INITIAL_SEED_COUNT initial seeds in $SEED_TARGET_DIR"
+if ls "$SEED_TARGET_DIR"/id:* >/dev/null 2>&1; then
+    echo "Seeds already found in $SEED_TARGET_DIR; reusing existing set."
+else
+    echo "Preparing $INITIAL_SEED_COUNT initial random seeds..."
+    for seed_idx in $(seq 0 $((INITIAL_SEED_COUNT - 1))); do
+        target_name=$(printf "id:%06d,orig" "$seed_idx")
+        target_path="$SEED_TARGET_DIR/$target_name"
+        case $seed_idx in
+            0) echo -n "A" > "$target_path" ;;
+            1) echo -n "B" > "$target_path" ;;
+            2) echo -n "C" > "$target_path" ;;
+            3) echo -n "D" > "$target_path" ;;
+            4) echo -n "A12345" > "$target_path" ;;
+            5) echo -n "AXYZ123" > "$target_path" ;;
+            6) echo -n "AYZ1234" > "$target_path" ;;
+            7) echo -n "B123456" > "$target_path" ;;
+            8) echo -n "BX12345" > "$target_path" ;;
+            9) echo -n "BY12345" > "$target_path" ;;
+            10) echo -n "C123456" > "$target_path" ;;
+            11) echo -n "CX12345" > "$target_path" ;;
+            12) echo -n "CY12345" > "$target_path" ;;
+            13) echo -n "D123456" > "$target_path" ;;
+            14) echo -n "TEST" > "$target_path" ;;
+            15) echo -n "TEST123" > "$target_path" ;;
+            16) echo -n "HELLO" > "$target_path" ;;
+            17) echo -n "HELLO123" > "$target_path" ;;
+            18) echo -n "WORLD" > "$target_path" ;;
+            19) echo -n "WORLD123" > "$target_path" ;;
+            20) echo -n "OTHER" > "$target_path" ;;
+            21) printf '\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF' > "$target_path" ;;
+            22) printf '\x80\x80\x80\x80\x80\x80\x80\x80' > "$target_path" ;;
+            23) printf '\x40\x40\x40\x40\x40' > "$target_path" ;;
+            24) printf '\x10\x10\x10' > "$target_path" ;;
+            25) printf '\x00\x02\x04\x06\x08\x0A\x0C\x0E' > "$target_path" ;;
+            26) printf '\x01\x03\x05\x07\x09\x0B\x0D\x0F' > "$target_path" ;;
+            27) printf '\x00\x01\x02\x03\x04\x05\x06\x07' > "$target_path" ;;
+            28) printf '\x01\x02\x03\x04\x05\x06\x07\x08' > "$target_path" ;;
+            29) printf '\x00\x01\x02\x03\x04\x05' > "$target_path" ;;
+            30) echo -n "AABBCC" > "$target_path" ;;
+            31) echo -n "AABCCC" > "$target_path" ;;
+            32) echo -n "ABCDEF" > "$target_path" ;;
+            33) echo -n "AABBCCDD" > "$target_path" ;;
+            34) echo -n "ATEST123" > "$target_path" ;;
+            35) echo -n "BHELLO123" > "$target_path" ;;
+            36) echo -n "CWORLD123" > "$target_path" ;;
+            37) echo -n "AXTEST123" > "$target_path" ;;
+            38) echo -n "AYHELLO123" > "$target_path" ;;
+            39) echo -n "BXWORLD123" > "$target_path" ;;
+            40) printf '\x00' > "$target_path" ;;
+            41) printf '\xFF' > "$target_path" ;;
+            42) printf '\x00\x00\x00\x00\x00' > "$target_path" ;;
+            43) printf '\xFF\xFF\xFF\xFF\xFF\xFF' > "$target_path" ;;
+            44|45|46|47|48|49)
+                seed_length=$((RANDOM % 20 + 1))
+                if [ $((seed_idx % 2)) -eq 0 ]; then
+                    python3 -c "import random, string; print(''.join(random.choices(string.printable, k=$seed_length)), end='')" > "$target_path" 2>/dev/null || \
+                    head -c "$seed_length" /dev/urandom | tr -dc '[:print:]' > "$target_path" 2>/dev/null || \
+                    echo -n "RANDOM$seed_idx" > "$target_path"
+                else
+                    head -c "$seed_length" /dev/urandom > "$target_path" 2>/dev/null || \
+                    python3 -c "import os; os.write(1, os.urandom($seed_length))" > "$target_path" || \
+                    echo -n "RANDOM$seed_idx" > "$target_path"
+                fi
+                ;;
+            *)
+                echo -n "seed$seed_idx" > "$target_path"
+                ;;
+        esac
+        if [ ! -s "$target_path" ]; then
+            echo "seed$seed_idx" > "$target_path"
+        fi
+    done
+    echo "Generated $INITIAL_SEED_COUNT initial seeds in $SEED_TARGET_DIR"
+fi
 
 # Build target program if needed
-echo "Compiling target program..."
-if [ ! -f "$TARGET_PROGRAM" ] || [ "$TARGET_SOURCE" -nt "$TARGET_PROGRAM" ]; then
+echo "Checking target binary..."
+if [ ! -f "$TARGET_PROGRAM" ]; then
     echo "Compiling $TARGET_SOURCE -> $TARGET_PROGRAM"
     gcc -o "$TARGET_PROGRAM" "$TARGET_SOURCE"
+else
+    echo "Target already built at $TARGET_PROGRAM; skipping compilation."
 fi
 
 # Environment variables
@@ -244,19 +211,89 @@ export SYMCC_OUTPUT_DIR="$OUTPUT_DIR"
 # MARCO_QUEUEID will be set per-seed: 0 for initial seeds (afl-slave), 1 for generated cases (fifo)
 # Marco-compatible: tree directories should be under output directory
 export MARCO_TREE_DIR="$OUTPUT_DIR"
+# Disable tmpfs usage in FastGen so repeated runs don't hit existing tmpfs dirs
+export ANGORA_DISABLE_TMPFS=1
 # MARCO_TRACEID will be extracted from filename id:XXXXXX per-seed
 # Do not set global TAINT_OPTIONS; set taint_file per-seed
 unset TAINT_OPTIONS || true
-# Use local-lib if it exists in Marco-SymFit directory, otherwise use system paths
+# Always include SymFit runtime libs in LD_LIBRARY_PATH
+SYM_RUNTIME_LIB="$MARCO_SYMFIT_ROOT/symfit/build/symsan/lib"
+RUNTIME_LD_PATH="$SYM_RUNTIME_LIB"
 if [ -d "$MARCO_SYMFIT_ROOT/local-lib" ]; then
-  export LD_LIBRARY_PATH="$MARCO_SYMFIT_ROOT/local-lib:${LD_LIBRARY_PATH:-}"
-else
-  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+  RUNTIME_LD_PATH="$MARCO_SYMFIT_ROOT/local-lib:$RUNTIME_LD_PATH"
 fi
+export LD_LIBRARY_PATH="$RUNTIME_LD_PATH:${LD_LIBRARY_PATH:-}"
 export PATH="/usr/lib/llvm-12/bin:${PATH}"
 
 # Set SYMCC_AFL_COVERAGE_MAP=disabled for MARCO_MODE (coverage map not needed)
 export SYMCC_AFL_COVERAGE_MAP=disabled
+
+# Automatically determine target program address range for library function filtering
+# This allows filtering out library function constraints (e.g., libc) from test program constraints
+# Strategy: Try runtime detection first (most accurate), then fall back to static analysis
+GET_ADDR_SCRIPT="$SCRIPT_DIR/get_target_address_range.sh"
+if [ -f "$GET_ADDR_SCRIPT" ] && [ -f "$TARGET_PROGRAM" ]; then
+    echo "Determining target program address range for library function filtering..."
+    
+    # Method 1: Try to get from a running process (if available)
+    # This is the most accurate method for QEMU/SymFit
+    RUNTIME_PID=""
+    TARGET_PROGRAM_BASENAME=$(basename "$TARGET_PROGRAM")
+    # Check if there's a running process that might be the target program
+    # In QEMU/SymFit, the target program runs under symqemu-x86_64
+    # We can try to find it by looking for processes that have the target binary mapped
+    for pid in $(pgrep -f "symqemu.*$TARGET_PROGRAM_BASENAME" 2>/dev/null | head -1); do
+        if [ -f "/proc/$pid/maps" ]; then
+            # Check if this process has the target binary mapped
+            if grep -q "$TARGET_PROGRAM_BASENAME" "/proc/$pid/maps" 2>/dev/null; then
+                RUNTIME_PID="$pid"
+                echo "Found running process with target binary: PID=$RUNTIME_PID"
+                break
+            fi
+        fi
+    done
+    
+    if [ -n "$RUNTIME_PID" ]; then
+        # Try runtime detection first (most accurate)
+        echo "Attempting runtime detection from PID $RUNTIME_PID..."
+        if eval "$($GET_ADDR_SCRIPT "$TARGET_PROGRAM" --runtime "$RUNTIME_PID" --auto-disable)"; then
+            if [ -n "${TARGET_BASE_ADDR:-}" ] && [ -n "${TARGET_SIZE:-}" ]; then
+                echo "✓ Library function filtering enabled (runtime): base=$TARGET_BASE_ADDR, size=$TARGET_SIZE"
+            else
+                echo "⚠ Runtime detection failed, trying static analysis..."
+                # Fall through to static analysis
+                unset TARGET_BASE_ADDR
+                unset TARGET_SIZE
+            fi
+        else
+            echo "⚠ Runtime detection failed, trying static analysis..."
+            unset TARGET_BASE_ADDR
+            unset TARGET_SIZE
+        fi
+    fi
+    
+    # Method 2: Fall back to static analysis if runtime detection failed or not available
+    if [ -z "${TARGET_BASE_ADDR:-}" ] || [ -z "${TARGET_SIZE:-}" ]; then
+        echo "Attempting static analysis from ELF file..."
+        if eval "$($GET_ADDR_SCRIPT "$TARGET_PROGRAM" --auto-disable)"; then
+            if [ -n "${TARGET_BASE_ADDR:-}" ] && [ -n "${TARGET_SIZE:-}" ]; then
+                echo "✓ Library function filtering enabled (static): base=$TARGET_BASE_ADDR, size=$TARGET_SIZE"
+                echo "  Note: Static analysis may not be accurate for QEMU/SymFit runtime"
+                echo "        Consider using runtime detection for better accuracy"
+            else
+                echo "⚠ Library function filtering disabled (could not determine address range)"
+            fi
+        else
+            echo "⚠ Library function filtering disabled (script failed)"
+            unset TARGET_BASE_ADDR
+            unset TARGET_SIZE
+        fi
+    fi
+else
+    echo "⚠ Library function filtering disabled (script or target binary not found)"
+    unset TARGET_BASE_ADDR
+    unset TARGET_SIZE
+fi
 
 echo "Environment variables set:"
 echo "  MARCO_MODE=$MARCO_MODE"
@@ -279,7 +316,7 @@ echo "Starting Marco FastGen (one-shot)..."
 # Marco-compatible: cd to OUTPUT_DIR so tree directories are created relative to it
 cd "$OUTPUT_DIR"
 # Set MARCO_LOG_DIR environment variable so FastGen knows where to write logs
-LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:$([ -d "$MARCO_SYMFIT_ROOT/local-lib" ] && echo "$MARCO_SYMFIT_ROOT/local-lib:" || echo "")$HOME/lib:${LD_LIBRARY_PATH:-}" \
+LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:$SYM_RUNTIME_LIB:$([ -d "$MARCO_SYMFIT_ROOT/local-lib" ] && echo "$MARCO_SYMFIT_ROOT/local-lib:" || echo "")$HOME/lib:${LD_LIBRARY_PATH:-}" \
 LLVM_CONFIG="/usr/lib/llvm-12/bin/llvm-config" \
 PATH="/usr/lib/llvm-12/bin:$PATH" \
 RUST_BACKTRACE=1 RUST_LOG=info \
@@ -291,7 +328,7 @@ FASTGEN_PID=$!
 echo "FastGen started with PID: $FASTGEN_PID"
 
 # Wait for FastGen to open FIFO
-sleep 2
+sleep 0.5
 
 # Start Marco Scheduler (writer of /tmp/myfifo)
 # Ensure only one scheduler instance is running
@@ -299,14 +336,14 @@ echo "Starting Marco scheduler..."
 cd "$WORK_DIR"
 # Kill any existing scheduler instances to prevent duplicates
 pkill -9 -f "marco/scheduler/main-MS.py" 2>/dev/null || true
-sleep 1
+sleep 0.3
 # Start scheduler with error handling to prevent crashes
 # Set MARCO_LOG_DIR environment variable so scheduler knows where to write logs
 MARCO_LOG_DIR="$LOG_DIR" python3 "$MARCO_SCHEDULER" -d 0 -m 2 > "$LOG_DIR/scheduler.log" 2>&1 &
 SCHEDULER_PID=$!
 echo "Scheduler started with PID: $SCHEDULER_PID"
 # Verify scheduler is actually running
-sleep 2
+sleep 0.5
 if ! ps -p $SCHEDULER_PID > /dev/null 2>&1; then
     echo "ERROR: Scheduler failed to start! Check $LOG_DIR/scheduler.log"
     exit 1
@@ -326,20 +363,20 @@ check_scheduler() {
 }
 
 # Live console tails: mirror of pcpipe records (written by scheduler) and scheduler native log
-( sleep 1; 
+( sleep 0.2; 
   : > "$LOG_DIR/pipe_mirror.log"
   stdbuf -oL tail -F "$LOG_DIR/pipe_mirror.log" | sed -u 's/^/[pcpipe] /'
 ) &
 PCPIPE_TAIL_PID=$!
 
-( sleep 1;
+( sleep 0.2;
   : > "$LOG_DIR/Gscheduler.log"
   stdbuf -oL tail -F "$LOG_DIR/Gscheduler.log" | sed -u 's/^/[sched] /'
 ) &
 SCHED_TAIL_PID=$!
 
 # Sanity check: ensure pcpipe has one reader (scheduler). Writer will appear when fastgen starts
-sleep 1
+sleep 0.2
 echo "[check] lsof /tmp/pcpipe (expect scheduler as reader)"
 lsof /tmp/pcpipe || true
 
@@ -372,100 +409,36 @@ for seed_idx in $(seq 0 $INITIAL_SEED_MAX_TID); do
     fi
     # tid is directly the seed_idx (0 to INITIAL_SEED_MAX_TID)
     tid=$seed_idx
-    echo "[SymFit] run seed tid=$tid file=$seed_path" | tee -a "$LOG_DIR/symfit.log"
-    # queueid will be automatically determined from input file path (Marco-compatible)
-    # Marco passes inputid through TAINT_OPTIONS: "taint_file={} tid={} shmid={} pipeid={} inputid={}"
-    # For SymFit, we use a simplified format: "taint_file={} inputid={}" (tid, shmid, pipeid are optional)
-    echo "[SymFit] Starting fgtest for tid=$tid..." | tee -a "$LOG_DIR/symfit.log"
-    timeout 30 env SYMCC_INPUT_FILE="$seed_path" TAINT_OPTIONS="taint_file=$seed_path inputid=$tid" MARCO_MODE=1 \
-      "$SYMFIT_FGTEST" "$SYMFIT_QEMU" "$TARGET_PROGRAM" "$seed_path" >> "$LOG_DIR/symfit.log" 2>&1 || {
-      echo "[SymFit] WARNING: fgtest for tid=$tid exited with code $? (timeout or error)" | tee -a "$LOG_DIR/symfit.log"
-    }
-    echo "[SymFit] fgtest completed for tid=$tid" | tee -a "$LOG_DIR/symfit.log"
-
-    # Check scheduler is still running before waiting for END token
-    check_scheduler || echo "WARNING: Scheduler check failed after seed tid=$tid"
+    # Execute SymFit (minimal logging for performance)
+    timeout 15 env SYMCC_INPUT_FILE="$seed_path" TAINT_OPTIONS="taint_file=$seed_path inputid=$tid" MARCO_MODE=1 \
+      TARGET_BASE_ADDR="${TARGET_BASE_ADDR:-}" \
+      TARGET_SIZE="${TARGET_SIZE:-}" \
+      "$SYMFIT_FGTEST" "$SYMFIT_QEMU" "$TARGET_PROGRAM" "$seed_path" >> "$LOG_DIR/symfit.log" 2>&1 || true
     
-    # After each seed run, wait (bounded) for FastGen to naturally emit END tokens
-    # This follows Marco's semantics: solve() sees EOF on /tmp/wp2, then run_solver writes END@@/ENDNEW@@...
-    echo "[SymFit] wait for END token after tid=$tid (up to 12s)" | tee -a "$LOG_DIR/symfit.log"
-    # Get initial line count to track new END tokens
-    INITIAL_PIPE_LINES=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")
-    waited=0
-    END_DETECTED=false
-    MAX_WAIT=12
-    # Use timeout to ensure we don't hang indefinitely
-    while [ $waited -lt $MAX_WAIT ]; do
-      # Force flush any pending output
-      sync 2>/dev/null || true
-      
-      CURRENT_PIPE_LINES=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")
-      
-      # Debug: log progress every 3 seconds
-      if [ $((waited % 3)) -eq 0 ] && [ $waited -gt 0 ]; then
-        echo "[SymFit] Still waiting for END token after tid=$tid (waited ${waited}s, INITIAL=$INITIAL_PIPE_LINES, CURRENT=$CURRENT_PIPE_LINES)" | tee -a "$LOG_DIR/symfit.log"
-      fi
-      
-      if [ "$CURRENT_PIPE_LINES" -gt "$INITIAL_PIPE_LINES" ]; then
-        # Check only new lines for END tokens
-        NEW_LINES=$((CURRENT_PIPE_LINES - INITIAL_PIPE_LINES))
-        if tail -n "$NEW_LINES" "$LOG_DIR/pipe_mirror.log" 2>/dev/null | grep -qE '^(END@@|ENDNEW@@|ENDDUP@@|ENDUNSAT@@)$'; then
-          echo "[SymFit] detected END token after tid=$tid (waited ${waited}s)" | tee -a "$LOG_DIR/symfit.log"
-          END_DETECTED=true
-          break
-        fi
-      fi
-      
-      # Also check last few lines as fallback (in case of line count issues)
-      # This is more robust and checks the actual last lines, not just new ones
-      if tail -n 20 "$LOG_DIR/pipe_mirror.log" 2>/dev/null | grep -qE '^(END@@|ENDNEW@@|ENDDUP@@|ENDUNSAT@@)$'; then
-        if [ "$END_DETECTED" = "false" ] && [ $waited -ge 2 ]; then
-          echo "[SymFit] detected END token after tid=$tid (waited ${waited}s, fallback check)" | tee -a "$LOG_DIR/symfit.log"
-          END_DETECTED=true
-          break
-        fi
-      fi
-      
-      # Check scheduler health during wait
-      if [ $((waited % 3)) -eq 0 ]; then
-        check_scheduler || echo "[SymFit] WARNING: Scheduler check failed during wait for END token" | tee -a "$LOG_DIR/symfit.log"
-      fi
-      
-      # Use timeout to prevent indefinite blocking
-      sleep 1
-      waited=$((waited+1))
-    done
-    
-    # CRITICAL: Always continue after timeout, even if END token not detected
-    if [ "$END_DETECTED" = "false" ]; then
-      echo "[SymFit] WARNING: No END token detected after ${MAX_WAIT}s for tid=$tid, continuing anyway" | tee -a "$LOG_DIR/symfit.log"
-      echo "[SymFit] DEBUG: INITIAL_PIPE_LINES=$INITIAL_PIPE_LINES, CURRENT_PIPE_LINES=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")" | tee -a "$LOG_DIR/symfit.log"
-      # Force continue - don't block the loop
-      END_DETECTED=false
-    fi
-
-    # Additionally ensure no writer remains on /tmp/wp2, so FastGen.solve observes EOF.
-    echo "[SymFit] ensure no writer holds /tmp/wp2 (seed tid=$tid)" | tee -a "$LOG_DIR/symfit.log"
-    waited_close=0
-    MAX_WAIT_CLOSE=8
-    while [ $waited_close -lt $MAX_WAIT_CLOSE ]; do
-      # lsof 退出码 0 表示有进程持有；非0 表示无。仅关心写端 (FD with 'w').
-      if ! lsof -Fpcf /tmp/wp2 2>/dev/null | grep -q 'w$'; then
-        echo "[SymFit] /tmp/wp2 has no writer after tid=$tid (waited ${waited_close}s)" | tee -a "$LOG_DIR/symfit.log"
-        break
-      fi
-      # Debug: log progress every 3 seconds
-      if [ $((waited_close % 3)) -eq 0 ] && [ $waited_close -gt 0 ]; then
-        echo "[SymFit] Still waiting for /tmp/wp2 to close after tid=$tid (waited ${waited_close}s)" | tee -a "$LOG_DIR/symfit.log"
-      fi
-      sleep 1
-      waited_close=$((waited_close+1))
-    done
-    # CRITICAL: Always continue after timeout, even if /tmp/wp2 still has writers
-    if lsof -Fpcf /tmp/wp2 2>/dev/null | grep -q 'w$'; then
-      echo "[SymFit] WARNING: /tmp/wp2 still has writer after ${MAX_WAIT_CLOSE}s for tid=$tid, continuing anyway" | tee -a "$LOG_DIR/symfit.log"
+    # Ensure tree file exists for this seed (create empty file if FastGen didn't generate one)
+    # This ensures all initial seeds have corresponding tree files in tree0/
+    tree_file="$OUTPUT_DIR/tree0/id:$(printf "%06d" "$tid")"
+    if [ ! -f "$tree_file" ]; then
+        # Create empty tree file as placeholder if FastGen didn't generate one
+        # This can happen if the seed doesn't trigger any interesting branches
+        touch "$tree_file"
+        echo "[SymFit] Created placeholder tree file for tid=$tid (no branches triggered)" >> "$LOG_DIR/symfit.log"
     fi
 done
+
+# Post-process: Ensure all initial seeds have tree files in tree0/
+# Some seeds may not trigger interesting branches, so FastGen doesn't generate tree files
+# We create empty placeholder files for missing ones to ensure completeness
+echo "Ensuring all initial seeds have tree files in tree0/..."
+for seed_idx in $(seq 0 $INITIAL_SEED_MAX_TID); do
+    tree_file="$OUTPUT_DIR/tree0/id:$(printf "%06d" "$seed_idx")"
+    if [ ! -f "$tree_file" ]; then
+        # Create empty tree file as placeholder if FastGen didn't generate one
+        touch "$tree_file"
+        echo "[Post-process] Created placeholder tree file for tid=$seed_idx (no branches triggered)" >> "$LOG_DIR/symfit.log"
+    fi
+done
+
 echo "SymFit initial seed runs completed (tid=0 to tid=$INITIAL_SEED_MAX_TID)"
 echo "Now continuing with Marco-style continuous execution from fifo/queue..."
 
@@ -548,141 +521,16 @@ while true; do
             tid=$tid_from_name  # Use the actual tid from filename
         fi
         
-        echo "[SymFit] ===== Processing new seed from fifo/queue =====" | tee -a "$LOG_DIR/symfit.log"
-        echo "[SymFit] tid=$tid (extracted from filename: $seed_name), file=$seed_path, queueid=1" | tee -a "$LOG_DIR/symfit.log"
-        echo "[SymFit] File size: $(stat -c%s "$seed_path" 2>/dev/null || echo "unknown") bytes" | tee -a "$LOG_DIR/symfit.log"
-        
-        # Check if FastGen is ready to process (by checking if it's waiting on /tmp/wp2)
-        # FastGen's solve() function should be waiting to read from /tmp/wp2
-        echo "[SymFit] Checking FastGen status before execution..." | tee -a "$LOG_DIR/symfit.log"
-        
-        # Execute the new seed from fifo/queue
+        # Execute the new seed from fifo/queue (minimal logging for performance)
         # SymFit will automatically detect queueid=1 from the file path containing "fifo/queue"
         # traceid will be extracted from filename "id:XXXXXX" format
         # This ensures tree files are written to tree1/ directory with correct traceid
-        echo "[SymFit] Starting SymFit execution with tid=$tid, queueid=1..." | tee -a "$LOG_DIR/symfit.log"
-        # seed_path is already absolute (from SEED_PATH which uses readlink -f)
-        # This ensures SymFit correctly detects queueid=1 from path containing "fifo/queue"
-        # Get initial line count of symfit.log to check if data was written
-        INITIAL_LOG_LINE_COUNT=$(wc -l < "$LOG_DIR/symfit.log" 2>/dev/null || echo "0")
-        
+        # Execute SymFit (minimal logging for performance)
         SYMCC_INPUT_FILE="$seed_path" TAINT_OPTIONS="taint_file=$seed_path inputid=$tid" MARCO_MODE=1 \
-          timeout 30 "$SYMFIT_FGTEST" "$SYMFIT_QEMU" "$TARGET_PROGRAM" "$seed_path" >> "$LOG_DIR/symfit.log" 2>&1 || true
-        SYMFIT_EXIT_CODE=$?
-        echo "[SymFit] SymFit execution completed with exit code=$SYMFIT_EXIT_CODE" | tee -a "$LOG_DIR/symfit.log"
-        
-        # Check if data was written to /tmp/wp2 by checking if "Writing to /tmp/wp2" appears in the log
-        CURRENT_LOG_LINE_COUNT=$(wc -l < "$LOG_DIR/symfit.log" 2>/dev/null || echo "0")
-        if [ "$CURRENT_LOG_LINE_COUNT" -gt "$INITIAL_LOG_LINE_COUNT" ]; then
-            # Check if "Writing to /tmp/wp2" appears in the new log lines
-            if tail -n $((CURRENT_LOG_LINE_COUNT - INITIAL_LOG_LINE_COUNT)) "$LOG_DIR/symfit.log" 2>/dev/null | grep -q "Writing to /tmp/wp2.*queueid=1"; then
-                echo "[SymFit] ✓ Data was written to /tmp/wp2 for tid=$tid" | tee -a "$LOG_DIR/symfit.log"
-            else
-                echo "[SymFit] WARNING: No data written to /tmp/wp2 for tid=$tid (QEMU may not have triggered any branches)" | tee -a "$LOG_DIR/symfit.log"
-            fi
-        fi
-        
-        # Check if data was written to /tmp/wp2
-        if [ -p /tmp/wp2 ]; then
-            echo "[SymFit] /tmp/wp2 exists as FIFO" | tee -a "$LOG_DIR/symfit.log"
-        else
-            echo "[SymFit] WARNING: /tmp/wp2 does not exist or is not a FIFO" | tee -a "$LOG_DIR/symfit.log"
-        fi
-        
-        # Wait for END token and ensure FastGen has processed the input
-        echo "[SymFit] Waiting for END token after tid=$tid (up to 12s)..." | tee -a "$LOG_DIR/symfit.log"
-        waited=0
-        END_DETECTED=false
-        TREE_FILE_CREATED=false
-        MAX_WAIT_FIFO=12
-        # Get the line count of pipe_mirror.log before waiting
-        INITIAL_LINE_COUNT=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")
-        while [ $waited -lt $MAX_WAIT_FIFO ]; do
-          # Force flush any pending output
-          sync 2>/dev/null || true
-          
-          # Check pipe_mirror.log for END tokens (check new lines since we started waiting)
-          # Use a more flexible pattern that handles whitespace
-          CURRENT_LINE_COUNT=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")
-          
-          # Debug: log progress every 3 seconds
-          if [ $((waited % 3)) -eq 0 ] && [ $waited -gt 0 ]; then
-            echo "[SymFit] Still waiting for END token after tid=$tid (waited ${waited}s, INITIAL=$INITIAL_LINE_COUNT, CURRENT=$CURRENT_LINE_COUNT)" | tee -a "$LOG_DIR/symfit.log"
-          fi
-          
-          if [ "$CURRENT_LINE_COUNT" -gt "$INITIAL_LINE_COUNT" ]; then
-            # Check the new lines for END tokens
-            if tail -n $((CURRENT_LINE_COUNT - INITIAL_LINE_COUNT)) "$LOG_DIR/pipe_mirror.log" 2>/dev/null | grep -qE '(END@@|ENDNEW@@|ENDDUP@@|ENDUNSAT@@)'; then
-              echo "[SymFit] ✓ Detected END token after tid=$tid (waited ${waited}s)" | tee -a "$LOG_DIR/symfit.log"
-              END_DETECTED=true
-            fi
-          fi
-          # Also check the last 20 lines as fallback (more robust than 500 lines)
-          if tail -n 20 "$LOG_DIR/pipe_mirror.log" 2>/dev/null | grep -qE '(END@@|ENDNEW@@|ENDDUP@@|ENDUNSAT@@)'; then
-            if [ "$END_DETECTED" = "false" ] && [ $waited -ge 2 ]; then
-              echo "[SymFit] ✓ Detected END token after tid=$tid (waited ${waited}s, fallback check)" | tee -a "$LOG_DIR/symfit.log"
-              END_DETECTED=true
-            fi
-          fi
-          # Check if FastGen has processed the case (check for tree file)
-          if [ -f "$OUTPUT_DIR/tree1/id:$(printf "%06d" $tid)" ]; then
-            if [ "$TREE_FILE_CREATED" = "false" ]; then
-              echo "[SymFit] ✓ Tree file created for tid=$tid" | tee -a "$LOG_DIR/symfit.log"
-              TREE_FILE_CREATED=true
-            fi
-            # If we have both END token and tree file, we can proceed
-            if [ "$END_DETECTED" = "true" ] && [ "$TREE_FILE_CREATED" = "true" ]; then
-              break
-            fi
-          fi
-          check_scheduler || echo "[SymFit] WARNING: Scheduler check failed during wait" | tee -a "$LOG_DIR/symfit.log"
-          sleep 1
-          waited=$((waited+1))
-        done
-        
-        # CRITICAL: Always continue after timeout, even if END token not detected
-        if [ "$END_DETECTED" = "false" ]; then
-            echo "[SymFit] WARNING: No END token detected after ${MAX_WAIT_FIFO}s for tid=$tid, continuing anyway" | tee -a "$LOG_DIR/symfit.log"
-            echo "[SymFit] DEBUG: INITIAL_LINE_COUNT=$INITIAL_LINE_COUNT, CURRENT_LINE_COUNT=$(wc -l < "$LOG_DIR/pipe_mirror.log" 2>/dev/null || echo "0")" | tee -a "$LOG_DIR/symfit.log"
-        fi
-        
-        if [ "$TREE_FILE_CREATED" = "false" ]; then
-            echo "[SymFit] WARNING: No tree file found for tid=$tid after ${MAX_WAIT_FIFO}s, continuing anyway" | tee -a "$LOG_DIR/symfit.log"
-            echo "[SymFit] This may indicate that FastGen did not process this input" | tee -a "$LOG_DIR/symfit.log"
-        fi
-        
-        # Ensure no writer on /tmp/wp2
-        waited_close=0
-        MAX_WAIT_CLOSE_FIFO=8
-        while [ $waited_close -lt $MAX_WAIT_CLOSE_FIFO ]; do
-          if ! lsof -Fpcf /tmp/wp2 2>/dev/null | grep -q 'w$'; then
-            echo "[SymFit] /tmp/wp2 has no writer after tid=$tid (waited ${waited_close}s)" | tee -a "$LOG_DIR/symfit.log"
-            break
-          fi
-          # Debug: log progress every 3 seconds
-          if [ $((waited_close % 3)) -eq 0 ] && [ $waited_close -gt 0 ]; then
-            echo "[SymFit] Still waiting for /tmp/wp2 to close after tid=$tid (waited ${waited_close}s)" | tee -a "$LOG_DIR/symfit.log"
-          fi
-          sleep 1
-          waited_close=$((waited_close+1))
-        done
-        # CRITICAL: Always continue after timeout, even if /tmp/wp2 still has writers
-        if lsof -Fpcf /tmp/wp2 2>/dev/null | grep -q 'w$'; then
-          echo "[SymFit] WARNING: /tmp/wp2 still has writer after ${MAX_WAIT_CLOSE_FIFO}s for tid=$tid, continuing anyway" | tee -a "$LOG_DIR/symfit.log"
-        fi
-        
-        # Additional wait to ensure FastGen has finished processing and is ready for next input
-        # This is important to avoid race conditions where we start the next seed before FastGen is ready
-        if [ "$TREE_FILE_CREATED" = "true" ]; then
-            echo "[SymFit] FastGen has processed tid=$tid, waiting 2s before next seed..." | tee -a "$LOG_DIR/symfit.log"
-            sleep 2
-        fi
-        
-        echo "[SymFit] ===== Completed processing seed tid=$tid =====\n" | tee -a "$LOG_DIR/symfit.log"
-        # Update FIFO_NEXT_TID to the next expected tid (tid + 1)
-        # This ensures we process seeds in order: id:000000, id:000001, id:000002, ...
+          TARGET_BASE_ADDR="${TARGET_BASE_ADDR:-}" \
+          TARGET_SIZE="${TARGET_SIZE:-}" \
+          timeout 15 "$SYMFIT_FGTEST" "$SYMFIT_QEMU" "$TARGET_PROGRAM" "$seed_path" >> "$LOG_DIR/symfit.log" 2>&1 || true
         FIFO_NEXT_TID=$((tid + 1))
-        echo "[SymFit] Updated FIFO_NEXT_TID to $FIFO_NEXT_TID" | tee -a "$LOG_DIR/symfit.log"
     else
         # No new seed found at expected ID, check if there are any seeds with higher IDs (in case of gaps)
         # This handles cases where FastGen generates seeds out of order
@@ -701,7 +549,6 @@ while true; do
         
         if [ "$FOUND_NEW_SEED" = "true" ] && [ $HIGHEST_TID_FOUND -ge $FIFO_NEXT_TID ]; then
             # Found a seed with higher ID, update FIFO_NEXT_TID to process it
-            echo "[SymFit] Found seed with higher ID: $HIGHEST_TID_FOUND (expected $FIFO_NEXT_TID), will process it" | tee -a "$LOG_DIR/symfit.log"
             FIFO_NEXT_TID=$HIGHEST_TID_FOUND
             continue
         fi
@@ -710,7 +557,8 @@ while true; do
     if [ "$FOUND_NEW_SEED" = "false" ]; then
         # No new seeds, wait a bit before checking again
         # This allows FastGen time to generate new seeds
-        sleep 2
+        # Reduced wait time for faster response (Marco original doesn't have this loop)
+        sleep 0.1
     fi
     
     # Check if FastGen and Scheduler are still running
@@ -728,7 +576,7 @@ echo "Continuous execution loop completed"
 
 # Wait a bit for CE to consume and produce outputs
 echo "Waiting for FastGen to consume seeds..."
-sleep 10
+sleep 2
 
 # Check process status
 echo "Checking process status..."
